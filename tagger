@@ -1,0 +1,281 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+from __future__ import print_function
+import sys,os,time
+import locale
+import argparse
+
+import mutagen
+from mutagen import File
+from mutagen.id3 import ID3,USLT
+from mutagen.mp3 import MP3
+from mutagen.aiff import AIFF
+import plyr
+import chardet
+
+class ID3Custom(ID3):
+    PEDANTIC = False
+
+# The ID3 tags aren't quite sensible to me. So I have my own names.
+lyrics='USLT::eng' # english lyrics
+album='TALB' # album name
+title='TIT2' # track title
+artist='TPE1' # album artist
+track='TRCK' # track number/total tracks
+cover='APIC:' # cover art
+genre='TCON'
+year='TDRC'
+subtitle='TIT3'
+
+minimum = set((album, title, artist, track))
+keepers = minimum | set((cover, subtitle, genre, year, lyrics))
+
+v=plyr.version().split()[1]
+ua = u'glyr/{} +https://www.github.com/littlej/tagger'.format(v)
+db = plyr.Database(os.path.expanduser('~')+'/.cache/glyrc')
+
+
+def process_file(fh, args):
+    if args.clean_tags:
+        clean_tags(fh, args)
+    if args.verbose:
+        print_tags(fh, args)
+    if args.remove_lyrics:
+        remove_lyrics(fh, args)
+    if args.get_lyrics:
+        get_lyrics(fh, args)
+    if args.add_lyrics:
+        add_lyrics(fh, args)
+
+
+def key_list(fh, keys):
+    global l,k
+    l = []
+    for k in keys:
+        s = k[0:4]
+        if k == lyrics:
+            s += "({}b)".format(len(fh.tags[k].text))
+        elif k == cover:
+            s += "({}k)".format(int(len(fh.tags[k].data)/1024))
+        l.append(s)
+    return l
+
+
+def print_tags(fh, args):
+    kl = key_list(fh, fh.keys())
+    print('{} --- {}'.format(",".join(kl), fh.filename))
+    if args.verbose>2:
+        try:
+            if lyrics in fh.keys():
+                print(fh.tags[lyrics].text.encode('utf8'))
+            else:
+                print("No lyrics")
+        except UnicodeEncodeError as err:
+            print("UnicodeError", err)
+            sys.exit()
+
+
+def clean_tags(fh, args):
+    present = set(fh.keys())
+    extra = present - keepers
+    needs = minimum - present
+    if args.verbose>1 and len(needs):
+        kl = key_list(fh, needs)
+        print("needs:", ",".join(kl), fh.filename)
+    if args.verbose>1 and len(extra):
+        kl = key_list(fh, extra)
+        print("extra:", ",".join(kl))
+    for k in extra:
+        fh.tags.pop(k)
+
+
+def remove_lyrics(fh, args):
+    if lyrics in fh.keys():
+        fh.tags.pop(lyrics)
+
+
+def get_lyrics(fh, args):
+    an = fh.tags[artist].text[0].encode('ascii', errors='ignore')
+    ti = fh.tags[title].text[0].encode('ascii', errors='ignore')
+    
+    if args.debug>1:
+        print("Querrying {}, {}".format(an, ti) )
+    q = plyr.Query(artist=an, title=ti,
+                   get_type='lyrics', useragent=ua, database=db)
+    r = q.commit()
+    
+    if len(r)==0:
+        if args.debug or args.verbose:
+            print("no lyrics found, {}, {}".format(
+                fh.tags[artist], fh.tags[title]) )
+        dummy = plyr.Database.make_dummy(db)
+        db.insert(q, dummy)
+        return ""
+    
+    if r[0].rating is -1:
+        if args.debug>1:
+            print("dummy entry, {}, {}".format(
+                fh.tags[artist], fh.tags[title]) )
+        return ""
+    
+    text = r[0].data
+    if args.debug>1:
+        print("cached:{}, {}b, {}, {}".format(
+            r[0].is_cached, len(text),
+            fh.tags[artist], fh.tags[title] ))
+    if args.debug>2:
+        print(text)
+    return text
+
+
+def add_lyrics(fh, args):
+    if lyrics in fh.keys() and len(fh.tags[lyrics].text) > 10:
+        return
+
+    try:
+        text = get_lyrics(fh, args)
+        if len(text)==0:
+            return
+        enc = chardet.detect(text)
+        text = unicode(text, enc['encoding'])
+        if args.debug>3:
+            print(text.decode('utf8'))
+        fh.tags.add(USLT(text=text, lang='eng', desc='', encoding=3))
+        if args.verbose:
+            print("Added lyrics ({}b) to ".format(len(text)), fh.filename)
+    except UnicodeDecodeError as err:
+        print(err)
+        print("Not adding lyrics to", fh.filename)
+
+
+def open_file(fn, args):
+    fnl = fn.lower()
+    try:
+        if fnl.endswith('mp3'):
+            return MP3(fn, ID3=ID3Custom)
+        elif fnl.endswith('aif'):
+            return AIFF(fn)
+        else:
+            if not fn.endswith(".DS_Store") and args.verbose:
+                print("Skipping", fn)
+    except KeyboardInterrupt:
+        raise
+    except Exception as err:
+        print(err)
+        print("Error loading " + fn)
+    return None
+
+
+def process_dir(path, files, args):
+    apic = None
+    talb = None
+    ds = os.stat(path)
+    files_list = []
+
+    # First pass through all files to clean up the individual files
+    # and figure out the album name & artwork
+    for fn in files:
+        ffn = os.path.join(path, fn)
+        fs = os.stat(ffn)
+        fh = open_file(ffn, args)
+        
+        if fh is None:
+            continue
+        
+        files_list.append(fn)
+        
+        if args.clean_tags:
+            clean_tags(fh, args)
+        if args.verbose:
+            print_tags(fh, args)
+        if args.remove_lyrics:
+            remove_lyrics(fh, args)
+        if args.get_lyrics:
+            get_lyrics(fh, args)
+        if args.add_lyrics:
+            add_lyrics(fh, args)
+
+        if album in fh.keys():
+            if talb is None:
+                talb = fh.tags[album]
+            elif talb.text != fh.tags[album].text:
+                print("Album title missmatch {} != {}".format(
+                    talb.text, fh.tags[album].text))
+
+        if cover in fh.keys():
+            if apic is None:
+                apic = fh.tags[cover]
+            elif len(apic.data) < len(fh.tags[cover].data):
+                print("Album cover data missmatch {}".format(talb.text))
+                apic = fh.tags[cover]
+
+        if not args.dry_run:
+            fh.save()
+            os.utime(ffn, (fs.st_atime, fs.st_mtime))
+
+        if args.rename_files:
+            pass
+
+    # Second pass through files is to make the album names
+    # and artwork match on all files 
+    for fn in files_list:
+        pass
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="""General purpose cleaner/fixer/reporter for the
+        tags in audio files. Currently only handles AIFF and MP3.""")
+
+    parser.add_argument(
+        "-d", default=0, dest="debug", action="count",
+        help="Increase the level of debug output.")
+
+    parser.add_argument(
+        "-v", default=0, dest="verbose", action="count",
+        help="Increase the level of status output.")
+
+    parser.add_argument(
+        "-n", "--dry-run", default=False, dest="dry_run", action="store_true",
+        help="Don't actually save files.")
+
+    parser.add_argument(
+        "-r", "--remove-lyrics", default=False, dest="remove_lyrics",
+        action="store_true",
+        help="Remove any existing lyrics.")
+
+    parser.add_argument(
+        "-c", "--clean-tags", default=False, dest="clean_tags",
+        action="store_true",
+        help="Remove tags other than {}".format(" ".join(keepers)))
+        
+    parser.add_argument(
+        "-l", "--add-lyrics", default=False, dest="add_lyrics",
+        action="store_true",
+        help="Lookup and add lyrics to files.")
+    
+    parser.add_argument(
+        "-g", "--get-lyrics", default=False, dest="get_lyrics",
+        action="store_true",
+        help="Lookup and store lyrics in database.")
+
+    parser.add_argument(
+        "--rename-files", default=False, dest="rename_files",
+        action="store_true",
+        help="Rename files to match ID3 data.")
+    
+    parser.add_argument(
+        'dirs', metavar='dir', type=str, nargs='+',
+        help='Directories to process.')
+
+    args = parser.parse_args()
+    if args.debug:
+        print(args)
+
+    # Walk all mp3 files starting at the directory root given
+    for path in args.dirs:
+        print("Scanning {}/".format(path))
+        for path, dirs, files in os.walk(path):
+            files.sort()
+            process_dir(path, files, args)
