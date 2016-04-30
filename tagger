@@ -96,6 +96,9 @@ def remove_lyrics(fh, args):
 
 
 def get_lyrics(fh, args):
+    if artist not in fh.keys() or title not in fh.keys():
+        if args.verbose: print("missing artist or title {}".format(fh.filename))
+        return
     an = fh.tags[artist].text[0].encode('ascii', errors='ignore')
     ti = fh.tags[title].text[0].encode('ascii', errors='ignore')
     
